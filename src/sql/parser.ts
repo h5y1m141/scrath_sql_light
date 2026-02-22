@@ -1,3 +1,6 @@
+import { Lexer } from "./lexer.ts";
+import { Token, TokenType } from "./token.ts";
+
 // ============================================================
 // 型定義 — Statement, WHERE条件, カラム定義
 // ============================================================
@@ -48,240 +51,406 @@ export type ParseResult =
 // ============================================================
 
 export function parse(sql: string): ParseResult {
-  const trimmed = removeComments(sql.trim());
-  if (trimmed === "") {
-    return { success: false, error: "Empty SQL statement" };
-  }
-
-  const upper = trimmed.toUpperCase();
-
-  if (upper.startsWith("CREATE TABLE")) {
-    return parseCreateTable(trimmed);
-  }
-  if (upper.startsWith("INSERT INTO")) {
-    return parseInsert(trimmed);
-  }
-  if (upper.startsWith("SELECT")) {
-    return parseSelect(trimmed);
-  }
-
-  return { success: false, error: "Unsupported SQL statement" };
+  const parser = new SqlParser(sql);
+  return parser.parse();
 }
 
 // ============================================================
-// コメント除去
+// SqlParser クラス（内部用）
 // ============================================================
 
-function removeComments(sql: string): string {
-  return sql
-    .split("\n")
-    .map((line) => {
-      const idx = line.indexOf("--");
-      return idx >= 0 ? line.slice(0, idx).trim() : line;
-    })
-    .filter((line) => line !== "")
-    .join(" ");
-}
+class SqlParser {
+  private lexer: Lexer;
+  private currentToken!: Token;
+  private peekToken!: Token;
 
-// ============================================================
-// CREATE TABLE パーサー
-// ============================================================
-
-function parseCreateTable(sql: string): ParseResult {
-  // 改行をスペースに統一
-  const normalized = sql.replace(/\n/g, " ");
-
-  const match = normalized.match(
-    /CREATE\s+TABLE\s+(\w+)\s*\((.*)\)/i,
-  );
-  if (!match) {
-    return { success: false, error: "Invalid CREATE TABLE syntax" };
+  constructor(input: string) {
+    this.lexer = new Lexer(input);
+    // currentToken と peekToken の両方をセット
+    this.nextToken();
+    this.nextToken();
   }
 
-  const tableName = match[1];
-  const columnDefs = match[2].split(",");
-  const columns: ColumnDef[] = [];
+  // ============================================================
+  // トークン操作ヘルパー
+  // ============================================================
 
-  for (const colDef of columnDefs) {
-    const parts = colDef.trim().split(/\s+/);
-    if (parts.length < 2) {
+  private nextToken(): void {
+    this.currentToken = this.peekToken;
+    this.peekToken = this.lexer.nextToken();
+  }
+
+  private curTokenIs(type: TokenType): boolean {
+    return this.currentToken.type === type;
+  }
+
+  private peekTokenIs(type: TokenType): boolean {
+    return this.peekToken.type === type;
+  }
+
+  private expectPeek(type: TokenType): boolean {
+    if (this.peekTokenIs(type)) {
+      this.nextToken();
+      return true;
+    }
+    return false;
+  }
+
+  // ============================================================
+  // メインの解析
+  // ============================================================
+
+  parse(): ParseResult {
+    if (this.curTokenIs(TokenType.EOF)) {
+      return { success: false, error: "Empty SQL statement" };
+    }
+
+    if (this.curTokenIs(TokenType.CREATE)) {
+      return this.parseCreateTable();
+    }
+    if (this.curTokenIs(TokenType.INSERT)) {
+      return this.parseInsert();
+    }
+    if (this.curTokenIs(TokenType.SELECT)) {
+      return this.parseSelect();
+    }
+
+    return { success: false, error: "Unsupported SQL statement" };
+  }
+
+  // ============================================================
+  // CREATE TABLE パーサー
+  // ============================================================
+
+  private parseCreateTable(): ParseResult {
+    // CREATE TABLE <tableName> (
+    if (!this.expectPeek(TokenType.TABLE)) {
+      return { success: false, error: "Invalid CREATE TABLE syntax" };
+    }
+    if (!this.expectPeek(TokenType.IDENT)) {
+      return { success: false, error: "Invalid CREATE TABLE syntax" };
+    }
+
+    const tableName = this.currentToken.literal;
+
+    if (!this.expectPeek(TokenType.LPAREN)) {
+      return { success: false, error: "Invalid CREATE TABLE syntax" };
+    }
+
+    // カラム定義をパース
+    const columns: ColumnDef[] = [];
+
+    while (!this.peekTokenIs(TokenType.RPAREN) && !this.peekTokenIs(TokenType.EOF)) {
+      this.nextToken();
+      const colResult = this.parseColumnDef();
+      if (!colResult.success) {
+        return colResult;
+      }
+      columns.push(colResult.column);
+
+      // カンマがあれば次のカラムへ
+      if (this.peekTokenIs(TokenType.COMMA)) {
+        this.nextToken();
+      }
+    }
+
+    if (!this.expectPeek(TokenType.RPAREN)) {
+      return { success: false, error: "Invalid CREATE TABLE syntax" };
+    }
+
+    if (columns.length === 0) {
+      return { success: false, error: "Invalid CREATE TABLE syntax" };
+    }
+
+    return {
+      success: true,
+      statement: { type: "CREATE_TABLE", tableName, columns },
+    };
+  }
+
+  private parseColumnDef(): { success: true; column: ColumnDef } | { success: false; error: string } {
+    // カラム名
+    if (!this.curTokenIs(TokenType.IDENT)) {
       return {
         success: false,
-        error: `Invalid column definition: ${colDef.trim()}`,
+        error: `Invalid column definition: ${this.currentToken.literal}`,
+      };
+    }
+    const colName = this.currentToken.literal;
+
+    // カラム型
+    this.nextToken();
+    const colType = this.parseColumnType();
+    if (!colType) {
+      return {
+        success: false,
+        error: `Invalid column definition: ${colName}`,
       };
     }
 
-    const colName = parts[0];
-    const colType = parts[1].toUpperCase();
-
-    if (colType !== "INTEGER" && colType !== "INT" && colType !== "TEXT") {
-      return {
-        success: false,
-        error: `Unsupported column type: ${parts[1]}`,
-      };
-    }
-
-    const normalizedType: ColumnType =
-      colType === "INT" ? "INTEGER" : (colType as ColumnType);
-
+    // 制約（オプション）
     const constraints: ColumnConstraint[] = [];
-
-    for (let i = 2; i < parts.length; i++) {
-      const upper = parts[i].toUpperCase();
-      if (upper === "PRIMARY" && parts[i + 1]?.toUpperCase() === "KEY") {
-        constraints.push("PRIMARY_KEY");
-        i++; // skip "KEY"
-      } else if (upper === "NOT" && parts[i + 1]?.toUpperCase() === "NULL") {
-        constraints.push("NOT_NULL");
-        i++; // skip "NULL"
-      } else if (upper === "UNIQUE") {
+    while (
+      this.peekTokenIs(TokenType.PRIMARY) ||
+      this.peekTokenIs(TokenType.NOT) ||
+      this.peekTokenIs(TokenType.UNIQUE)
+    ) {
+      this.nextToken();
+      if (this.curTokenIs(TokenType.PRIMARY)) {
+        if (this.expectPeek(TokenType.KEY)) {
+          constraints.push("PRIMARY_KEY");
+        }
+      } else if (this.curTokenIs(TokenType.NOT)) {
+        if (this.expectPeek(TokenType.NULL_KW)) {
+          constraints.push("NOT_NULL");
+        }
+      } else if (this.curTokenIs(TokenType.UNIQUE)) {
         constraints.push("UNIQUE");
       }
     }
 
-    columns.push({ name: colName, type: normalizedType, constraints });
+    return {
+      success: true,
+      column: { name: colName, type: colType, constraints },
+    };
   }
 
-  return {
-    success: true,
-    statement: { type: "CREATE_TABLE", tableName, columns },
-  };
-}
-
-// ============================================================
-// INSERT INTO パーサー
-// ============================================================
-
-function parseInsert(sql: string): ParseResult {
-  const match = sql.match(
-    /INSERT\s+INTO\s+(\w+)\s*\((.*?)\)\s*VALUES\s*\((.*?)\)/i,
-  );
-  if (!match) {
-    return { success: false, error: "Invalid INSERT syntax" };
+  private parseColumnType(): ColumnType | null {
+    if (this.curTokenIs(TokenType.INTEGER_KW)) return "INTEGER";
+    if (this.curTokenIs(TokenType.INT_KW)) return "INTEGER"; // INT → INTEGER に正規化
+    if (this.curTokenIs(TokenType.TEXT_KW)) return "TEXT";
+    return null;
   }
 
-  const tableName = match[1];
-  const columns = match[2].split(",").map((c) => c.trim());
-  const rawValues = match[3].split(",").map((v) => v.trim());
+  // ============================================================
+  // INSERT INTO パーサー
+  // ============================================================
 
-  const values: (string | number)[] = [];
-  for (const raw of rawValues) {
-    const parsed = parseValue(raw);
-    if (parsed === null) {
-      return { success: false, error: `Invalid value: ${raw}` };
+  private parseInsert(): ParseResult {
+    // INSERT INTO <tableName>
+    if (!this.expectPeek(TokenType.INTO)) {
+      return { success: false, error: "Invalid INSERT syntax" };
     }
-    values.push(parsed);
-  }
-
-  return {
-    success: true,
-    statement: { type: "INSERT", tableName, columns, values },
-  };
-}
-
-// ============================================================
-// SELECT パーサー
-// ============================================================
-
-function parseSelect(sql: string): ParseResult {
-  // セミコロン除去
-  const cleaned = sql.replace(/;\s*$/, "");
-
-  const match = cleaned.match(
-    /SELECT\s+(.*?)\s+FROM\s+(\w+)(?:\s+WHERE\s+(.*))?/i,
-  );
-  if (!match) {
-    return { success: false, error: "Invalid SELECT syntax" };
-  }
-
-  const columns = match[1].split(",").map((c) => c.trim());
-  const tableName = match[2];
-  const where: Record<string, WhereCondition> = {};
-
-  if (match[3]) {
-    const whereResult = parseWhereClause(match[3].trim());
-    if (!whereResult.success) {
-      return whereResult;
+    if (!this.expectPeek(TokenType.IDENT)) {
+      return { success: false, error: "Invalid INSERT syntax" };
     }
-    Object.assign(where, whereResult.conditions);
+
+    const tableName = this.currentToken.literal;
+
+    // ( カラムリスト )
+    if (!this.expectPeek(TokenType.LPAREN)) {
+      return { success: false, error: "Invalid INSERT syntax" };
+    }
+
+    const columns = this.parseIdentifierList();
+    if (columns === null) {
+      return { success: false, error: "Invalid INSERT syntax" };
+    }
+
+    if (!this.expectPeek(TokenType.RPAREN)) {
+      return { success: false, error: "Invalid INSERT syntax" };
+    }
+
+    // VALUES ( 値リスト )
+    if (!this.expectPeek(TokenType.VALUES)) {
+      return { success: false, error: "Invalid INSERT syntax" };
+    }
+    if (!this.expectPeek(TokenType.LPAREN)) {
+      return { success: false, error: "Invalid INSERT syntax" };
+    }
+
+    const valuesResult = this.parseValueList();
+    if (!valuesResult.success) {
+      return valuesResult;
+    }
+
+    if (!this.expectPeek(TokenType.RPAREN)) {
+      return { success: false, error: "Invalid INSERT syntax" };
+    }
+
+    return {
+      success: true,
+      statement: { type: "INSERT", tableName, columns, values: valuesResult.values },
+    };
   }
 
-  return {
-    success: true,
-    statement: { type: "SELECT", tableName, columns, where },
-  };
-}
+  private parseIdentifierList(): string[] | null {
+    const identifiers: string[] = [];
 
-// ============================================================
-// WHERE 句パーサー
-// ============================================================
+    if (!this.expectPeek(TokenType.IDENT)) {
+      return null;
+    }
+    identifiers.push(this.currentToken.literal);
 
-type WhereParseResult =
-  | { success: true; conditions: Record<string, WhereCondition> }
-  | { success: false; error: string };
-
-const OPERATORS = [">=", "<=", "!=", ">", "<", "="] as const;
-
-function parseWhereClause(wherePart: string): WhereParseResult {
-  const conditions: Record<string, WhereCondition> = {};
-
-  // AND で分割 (大文字小文字無視)
-  const parts = wherePart.split(/\s+AND\s+/i);
-
-  for (const part of parts) {
-    const trimmed = part.trim();
-
-    // 演算子を探す
-    let foundOperator: (typeof OPERATORS)[number] | null = null;
-    let operatorIndex = -1;
-
-    for (const op of OPERATORS) {
-      const idx = trimmed.indexOf(op);
-      if (idx > 0) {
-        foundOperator = op;
-        operatorIndex = idx;
-        break;
+    while (this.peekTokenIs(TokenType.COMMA)) {
+      this.nextToken(); // skip comma
+      if (!this.expectPeek(TokenType.IDENT)) {
+        return null;
       }
+      identifiers.push(this.currentToken.literal);
     }
 
-    if (!foundOperator || operatorIndex < 0) {
-      return { success: false, error: `Invalid WHERE condition: ${trimmed}` };
+    return identifiers;
+  }
+
+  private parseValueList(): { success: true; values: (string | number)[] } | { success: false; error: string } {
+    const values: (string | number)[] = [];
+
+    this.nextToken();
+    const first = this.parseValue();
+    if (first === null) {
+      return { success: false, error: `Invalid value: ${this.currentToken.literal}` };
+    }
+    values.push(first);
+
+    while (this.peekTokenIs(TokenType.COMMA)) {
+      this.nextToken(); // skip comma
+      this.nextToken();
+      const val = this.parseValue();
+      if (val === null) {
+        return { success: false, error: `Invalid value: ${this.currentToken.literal}` };
+      }
+      values.push(val);
     }
 
-    const column = trimmed.slice(0, operatorIndex).trim();
-    const rawValue = trimmed.slice(operatorIndex + foundOperator.length).trim();
+    return { success: true, values };
+  }
 
-    const value = parseValue(rawValue);
+  // ============================================================
+  // SELECT パーサー
+  // ============================================================
+
+  private parseSelect(): ParseResult {
+    // SELECT <columns> FROM <tableName>
+    this.nextToken();
+
+    // カラムリスト
+    const columns: string[] = [];
+    if (this.curTokenIs(TokenType.ASTERISK)) {
+      columns.push("*");
+    } else if (this.curTokenIs(TokenType.IDENT)) {
+      columns.push(this.currentToken.literal);
+      while (this.peekTokenIs(TokenType.COMMA)) {
+        this.nextToken(); // skip comma
+        this.nextToken();
+        columns.push(this.currentToken.literal);
+      }
+    } else {
+      return { success: false, error: "Invalid SELECT syntax" };
+    }
+
+    // FROM
+    if (!this.expectPeek(TokenType.FROM)) {
+      return { success: false, error: "Invalid SELECT syntax" };
+    }
+    if (!this.expectPeek(TokenType.IDENT)) {
+      return { success: false, error: "Invalid SELECT syntax" };
+    }
+
+    const tableName = this.currentToken.literal;
+    const where: Record<string, WhereCondition> = {};
+
+    // WHERE (オプション)
+    if (this.peekTokenIs(TokenType.WHERE)) {
+      this.nextToken(); // skip WHERE
+      const whereResult = this.parseWhereClause();
+      if (!whereResult.success) {
+        return whereResult;
+      }
+      Object.assign(where, whereResult.conditions);
+    }
+
+    return {
+      success: true,
+      statement: { type: "SELECT", tableName, columns, where },
+    };
+  }
+
+  // ============================================================
+  // WHERE 句パーサー
+  // ============================================================
+
+  private parseWhereClause():
+    | { success: true; conditions: Record<string, WhereCondition> }
+    | { success: false; error: string } {
+    const conditions: Record<string, WhereCondition> = {};
+
+    // 最初の条件
+    const first = this.parseWhereCondition();
+    if (!first.success) return first;
+    conditions[first.column] = first.condition;
+
+    // AND で繋がる追加条件
+    while (this.peekTokenIs(TokenType.AND)) {
+      this.nextToken(); // skip AND
+      const cond = this.parseWhereCondition();
+      if (!cond.success) return cond;
+      conditions[cond.column] = cond.condition;
+    }
+
+    return { success: true, conditions };
+  }
+
+  private parseWhereCondition():
+    | { success: true; column: string; condition: WhereCondition }
+    | { success: false; error: string } {
+    // カラム名
+    if (!this.expectPeek(TokenType.IDENT)) {
+      return { success: false, error: "Invalid WHERE condition" };
+    }
+    const column = this.currentToken.literal;
+
+    // 演算子
+    this.nextToken();
+    const operator = this.parseOperator();
+    if (!operator) {
+      return { success: false, error: `Invalid WHERE condition: ${column}` };
+    }
+
+    // 値
+    this.nextToken();
+    const value = this.parseValue();
     if (value === null) {
-      return { success: false, error: `Invalid value in WHERE: ${rawValue}` };
+      return { success: false, error: `Invalid value in WHERE: ${this.currentToken.literal}` };
     }
 
-    conditions[column] = { operator: foundOperator, value };
+    return { success: true, column, condition: { operator, value } };
   }
 
-  return { success: true, conditions };
-}
-
-// ============================================================
-// 値パーサー (文字列 or 数値)
-// ============================================================
-
-function parseValue(raw: string): string | number | null {
-  // シングルクォート文字列
-  if (raw.startsWith("'") && raw.endsWith("'")) {
-    return raw.slice(1, -1);
+  private parseOperator(): WhereCondition["operator"] | null {
+    switch (this.currentToken.type) {
+      case TokenType.EQ:
+        return "=";
+      case TokenType.NEQ:
+        return "!=";
+      case TokenType.GT:
+        return ">";
+      case TokenType.LT:
+        return "<";
+      case TokenType.GTE:
+        return ">=";
+      case TokenType.LTE:
+        return "<=";
+      default:
+        return null;
+    }
   }
 
-  // ダブルクォート文字列
-  if (raw.startsWith('"') && raw.endsWith('"')) {
-    return raw.slice(1, -1);
-  }
+  // ============================================================
+  // 値パーサー
+  // ============================================================
 
-  // 整数
-  const num = Number(raw);
-  if (!Number.isNaN(num) && Number.isInteger(num)) {
-    return num;
+  private parseValue(): string | number | null {
+    if (this.curTokenIs(TokenType.STRING)) {
+      return this.currentToken.literal;
+    }
+    if (this.curTokenIs(TokenType.NUMBER)) {
+      const num = Number(this.currentToken.literal);
+      if (!Number.isNaN(num) && Number.isInteger(num)) {
+        return num;
+      }
+      return null;
+    }
+    return null;
   }
-
-  return null;
 }
